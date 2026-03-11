@@ -1,2 +1,1 @@
-# skiplist
-Practice for implement lock free concurrent skip list
+Just a demo to test github copilot build something, not personel project
