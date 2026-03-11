@@ -3,6 +3,7 @@ package skiplist
 import (
 	"fmt"
 	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -279,6 +280,83 @@ func TestConcurrentMixed(t *testing.T) {
 	}
 }
 
+func TestFindConcurrentSafety(t *testing.T) {
+	const (
+		keySpace = 128
+		writers  = 8
+		finders  = 8
+		iters    = 500
+	)
+
+	sl := New()
+	for i := 0; i < keySpace; i++ {
+		sl.Add(i, nil)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var bad atomic.Bool
+
+	wg.Add(writers + finders)
+
+	for g := 0; g < writers; g++ {
+		g := g
+		go func() {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(10_000 + g)))
+			<-start
+			for i := 0; i < iters; i++ {
+				key := rng.Intn(keySpace)
+				if i%2 == 0 {
+					sl.Remove(key)
+					continue
+				}
+				sl.Add(key, nil)
+			}
+		}()
+	}
+
+	for g := 0; g < finders; g++ {
+		g := g
+		go func() {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(20_000 + g)))
+			preds := make([]*node, maxLevel)
+			succs := make([]*node, maxLevel)
+			<-start
+			for i := 0; i < iters; i++ {
+				key := rng.Intn(keySpace)
+				sl.find(key, preds, succs)
+				for level := 0; level < maxLevel; level++ {
+					if preds[level] == nil || succs[level] == nil {
+						bad.Store(true)
+						return
+					}
+					if preds[level].key >= key {
+						bad.Store(true)
+						return
+					}
+					if succs[level].key < key {
+						bad.Store(true)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if bad.Load() {
+		t.Fatal("find returned invalid predecessor/successor bounds under concurrent access")
+	}
+
+	if ks := keys(sl); !isSorted(ks) {
+		t.Fatal("list is not sorted after concurrent find activity")
+	}
+}
+
 // TestNoDeadlock verifies that concurrent operations complete without deadlocking.
 // The test binary's -timeout flag (default 10 min) acts as the outer deadline.
 func TestNoDeadlock(t *testing.T) {
@@ -297,6 +375,67 @@ func TestNoDeadlock(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestLenConcurrentSafety(t *testing.T) {
+	const (
+		keySpace = 256
+		writers  = 8
+		readers  = 4
+		iters    = 1_000
+	)
+
+	sl := New()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var outOfRange atomic.Bool
+
+	wg.Add(writers + readers)
+
+	for g := 0; g < writers; g++ {
+		g := g
+		go func() {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(30_000 + g)))
+			<-start
+			for i := 0; i < iters; i++ {
+				key := rng.Intn(keySpace)
+				if rng.Intn(2) == 0 {
+					sl.Add(key, nil)
+				} else {
+					sl.Remove(key)
+				}
+			}
+		}()
+	}
+
+	for g := 0; g < readers; g++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < iters; i++ {
+				n := sl.Len()
+				if n < 0 || n > keySpace {
+					outOfRange.Store(true)
+					return
+				}
+				runtime.Gosched()
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if outOfRange.Load() {
+		t.Fatal("Len returned a value outside the possible key range under concurrent access")
+	}
+
+	got := sl.Len()
+	want := len(keys(sl))
+	if got != want {
+		t.Fatalf("Len=%d, want %d after concurrent updates quiesce", got, want)
+	}
 }
 
 // ── benchmarks ────────────────────────────────────────────────────────────────

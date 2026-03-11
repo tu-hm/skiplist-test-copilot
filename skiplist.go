@@ -1,8 +1,13 @@
-// Package skiplist provides a lock-free concurrent skip list.
+// Package skiplist provides a concurrent skip list.
 //
 // The implementation is based on the algorithm described in:
 //
 //	"A Practical Lock-Free Skiplist" (Herlihy, Lev, Luchangco, Shavit, 2006)
+//
+// This implementation preserves the algorithm's lazy-deletion structure, but
+// uses mutex-assisted compare-and-swap on (next pointer, mark) pairs rather
+// than unsafe pointer tagging.  As a result, operations are safe for
+// concurrent use, but the implementation is not strictly lock-free.
 //
 // Logical deletion is performed by atomically marking the lowest-level next
 // pointer of a node.  Physical removal of logically-deleted nodes is performed
@@ -90,12 +95,11 @@ func newNode(key int, value any, level int) *node {
 	return n
 }
 
-// SkipList is a lock-free concurrent ordered set / map keyed by integers.
+// SkipList is a concurrent ordered set / map keyed by integers.
 type SkipList struct {
-	head    *node
-	tail    *node
-	levelHi atomic.Int32 // highest currently used level (0-based)
-	rng     rngSource
+	head *node
+	tail *node
+	rng  rngSource
 }
 
 // rngSource is a goroutine-safe random source used for level generation.
@@ -118,15 +122,17 @@ func New() *SkipList {
 	for i := 0; i < maxLevel; i++ {
 		head.next[i].node = tail
 	}
-	sl := &SkipList{
-		head: head,
-		tail: tail,
-	}
+	sl := &SkipList{head: head, tail: tail}
 	sl.rng.rng = rand.New(rand.NewSource(42)) //nolint:gosec // not security-sensitive
 	return sl
 }
 
-// randomLevel returns a random level in [0, maxLevel-1] using geometric distribution.
+// randomLevel returns a random level in [0, maxLevel-1] using a geometric
+// distribution.
+//
+// Random promotion is what gives skip lists their probabilistic balancing:
+// only a fraction of nodes appear on each higher level, which keeps the
+// expected height and traversal cost logarithmic without explicit rebalancing.
 func (sl *SkipList) randomLevel() int {
 	level := 0
 	for level < maxLevel-1 && sl.rng.float64() < probability {
@@ -141,6 +147,10 @@ func (sl *SkipList) randomLevel() int {
 //
 // preds[i] is the rightmost node at level i whose key < key.
 // succs[i] is preds[i].next[i] (after cleanup).
+//
+// find is safe to call concurrently. It may observe a transient view while
+// other goroutines update the list, so callers should treat the returned
+// predecessor/successor arrays as search results for the current attempt only.
 func (sl *SkipList) find(key int, preds, succs []*node) bool {
 	found := false
 retry:
@@ -217,17 +227,6 @@ func (sl *SkipList) Add(key int, value any) bool {
 			}
 		}
 
-		// Update the tracked high-water level if necessary.
-		for {
-			hi := sl.levelHi.Load()
-			if int32(topLevel) <= hi {
-				break
-			}
-			if sl.levelHi.CompareAndSwap(hi, int32(topLevel)) {
-				break
-			}
-		}
-
 		return true
 	}
 }
@@ -299,7 +298,10 @@ func (sl *SkipList) Contains(key int) bool {
 }
 
 // Len returns the number of elements currently in the skip list.
-// This is an O(n) operation that traverses the bottom level.
+//
+// Len is safe for concurrent use. It traverses the bottom level and counts
+// only nodes whose level-0 link is not marked, so concurrent updates may cause
+// it to return a weakly consistent snapshot rather than a linearizable size.
 func (sl *SkipList) Len() int {
 	count := 0
 	curr, _ := sl.head.next[0].get()
